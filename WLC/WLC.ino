@@ -1,0 +1,314 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "BluetoothSerial.h"
+
+BluetoothSerial SerialBT;
+
+/* ---------------- PIN CONFIG ---------------- */
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define LED_BT 2
+#define MOTOR 26
+#define WATER_SENSOR 27   // SHORT TO GND = WATER PRESENT
+
+/* ---------------- OLED ---------------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ---------------- VARIABLES ---------------- */
+float distance = 0;
+unsigned long duration;
+
+bool motorState = false;
+bool btConnected = false;
+
+unsigned long lastUltrasonic = 0;
+unsigned long lastDisplay = 0;
+unsigned long lastBTsend = 0;
+unsigned long lastBlink = 0;
+
+unsigned long motorStartTime = 0;
+bool checkingWater = false;
+bool waterErrorSent = false;
+
+int WTLH = 10;   // tank full level (cm)
+
+int currentTime = 0;
+int AMON = -1, AMOFF = -1, PMON = -1, PMOFF = -1;
+
+int lastTriggeredTime = -1;
+unsigned long waterLossTimer = 0;
+bool waterLossChecking = false;
+
+int startupCountdown = 0;
+int lossCountdown = 0;
+
+/* ========================================================= */
+
+bool waterAvailable() {
+  return digitalRead(WATER_SENSOR) == LOW;   // LOW = Water Present
+}
+
+/* ========================================================= */
+
+void setup() {
+
+  Serial.begin(115200);
+  SerialBT.begin("ESP32_WATER_SYSTEM");
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_BT, OUTPUT);
+  pinMode(MOTOR, OUTPUT);
+  pinMode(WATER_SENSOR, INPUT_PULLUP);   // 🔥 INVERTED LOGIC
+
+  digitalWrite(MOTOR, LOW);
+
+  Wire.begin(21, 22);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(10, 20);
+  display.println("SYSTEM ON");
+  display.display();
+  delay(1000);
+}
+
+/* ========================================================= */
+
+void loop() {
+
+  handleBluetoothLED();
+  readUltrasonic();
+  updateDisplay();
+  sendLiveData();
+  handleBluetoothCommands();
+  handleTankLogic();
+  handleTimerLogic();
+  handleWaterSafety();
+}
+
+/* ================= ULTRASONIC ================= */
+
+void readUltrasonic() {
+
+  if (millis() - lastUltrasonic < 300) return;
+  lastUltrasonic = millis();
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 25000);
+
+  if (duration == 0) return;
+
+  float newDistance = duration * 0.034 / 2.0;
+
+  if (newDistance > 2 && newDistance < 400) {
+    distance = newDistance;
+  }
+}
+
+/* ================= OLED DISPLAY ================= */
+
+void updateDisplay() {
+
+  if (millis() - lastDisplay < 300) return;
+  lastDisplay = millis();
+
+  display.clearDisplay();
+
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print(distance, 1);
+  display.print(" cm");
+
+  display.setTextSize(1);
+  display.setCursor(0, 30);
+  display.print("Motor: ");
+  display.print(motorState ? "ON" : "OFF");
+
+  display.setCursor(0, 45);
+  display.print("WTLH: ");
+  display.print(WTLH);
+
+  display.setCursor(0, 55);
+display.print("Water: ");
+
+if (checkingWater) {
+  display.print("10s:");
+  display.print(startupCountdown);
+}
+else if (waterLossChecking) {
+  display.print("5s:");
+  display.print(lossCountdown);
+}
+else {
+  display.print(waterAvailable() ? "OK" : "NO");
+}
+
+  display.display();
+}
+
+/* ================= BLUETOOTH LED ================= */
+
+void handleBluetoothLED() {
+
+  btConnected = SerialBT.hasClient();
+
+  if (!btConnected) {
+    if (millis() - lastBlink > 500) {
+      digitalWrite(LED_BT, !digitalRead(LED_BT));
+      lastBlink = millis();
+    }
+  } else {
+    digitalWrite(LED_BT, HIGH);
+  }
+}
+
+/* ================= LIVE DATA SEND ================= */
+
+void sendLiveData() {
+
+  if (!btConnected) return;
+  if (millis() - lastBTsend < 500) return;
+
+  lastBTsend = millis();
+
+  SerialBT.println(distance);
+}
+
+/* ================= BLUETOOTH COMMANDS ================= */
+
+void handleBluetoothCommands() {
+
+  if (!SerialBT.available()) return;
+
+  String cmd = SerialBT.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd == "M1") motorON();
+  else if (cmd == "M0") motorOFF();
+  else if (cmd.startsWith("WTLH:")) WTLH = cmd.substring(5).toInt();
+  else if (cmd.startsWith("TIME:")) currentTime = cmd.substring(5).toInt();
+  else if (cmd.startsWith("AMON:")) AMON = cmd.substring(5).toInt();
+  else if (cmd.startsWith("AMOFF:")) AMOFF = cmd.substring(6).toInt();
+  else if (cmd.startsWith("PMON:")) PMON = cmd.substring(5).toInt();
+  else if (cmd.startsWith("PMOFF:")) PMOFF = cmd.substring(6).toInt();
+}
+
+/* ================= MOTOR CONTROL ================= */
+
+void motorON() {
+
+  if (distance <= WTLH) {
+    if (btConnected) SerialBT.println("Tank already full");
+    return;
+  }
+
+  digitalWrite(MOTOR, HIGH);
+  motorState = true;
+  motorStartTime = millis();
+  checkingWater = true;
+}
+
+void motorOFF() {
+  digitalWrite(MOTOR, LOW);
+  motorState = false;
+  checkingWater = false;
+}
+
+/* ================= TANK FULL LOGIC ================= */
+
+void handleTankLogic() {
+
+  if (motorState && distance <= WTLH) {
+    motorOFF();
+    if (btConnected) SerialBT.println("Tank is full");
+  }
+}
+
+/* ================= TIMER LOGIC ================= */
+
+void handleTimerLogic() {
+
+  if (currentTime == lastTriggeredTime) return;
+
+  if (currentTime == AMON || currentTime == PMON) {
+    motorON();
+    lastTriggeredTime = currentTime;
+  }
+
+  if (currentTime == AMOFF || currentTime == PMOFF) {
+    motorOFF();
+    lastTriggeredTime = currentTime;
+  }
+}
+
+/* ================= WATER SOURCE SAFETY ================= */
+
+void handleWaterSafety() {
+
+  if (!motorState) {
+    startupCountdown = 0;
+    lossCountdown = 0;
+    waterLossChecking = false;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  /* -------- 10 SECOND STARTUP CHECK -------- */
+
+  if (checkingWater) {
+
+    startupCountdown = 10 - ((now - motorStartTime) / 1000);
+
+    if (now - motorStartTime >= 10000) {
+
+      if (!waterAvailable()) {
+        motorOFF();
+        if (btConnected) SerialBT.println("Water source missing");
+      }
+
+      checkingWater = false;
+      startupCountdown = 0;
+    }
+
+    return;
+  }
+
+  /* -------- 5 SECOND RUNNING LOSS CHECK -------- */
+
+  if (!waterAvailable()) {
+
+    if (!waterLossChecking) {
+      waterLossChecking = true;
+      waterLossTimer = now;
+    }
+
+    lossCountdown = 5 - ((now - waterLossTimer) / 1000);
+
+    if (now - waterLossTimer >= 5000) {
+      motorOFF();
+      if (btConnected) SerialBT.println("Water source missing");
+      waterLossChecking = false;
+      lossCountdown = 0;
+    }
+
+  } else {
+    waterLossChecking = false;
+    lossCountdown = 0;
+  }
+}
