@@ -1,0 +1,49 @@
+ESP32 pin connection
+HC-SR04 Pin	ESP32 Pin
+
+VCC	5V
+GND	GND
+TRIG	GPIO 5
+ECHO	GPIO 18 ⚠
+
+IMPORTANT
+
+HC-SR04 ECHO gives 5V output.
+ESP32 GPIO supports only 3.3V.
+
+Use voltage divider:
+ECHO ---- 1kΩ ---- GPIO18
+            |
+           2kΩ
+            |
+           GND
+
+
+OLED Pin	ESP32 Pin
+
+VCC	3.3V
+GND	GND
+SCL	GPIO 22
+SDA	GPIO 21
+
+
+Relay Pin	ESP32 Pin
+
+IN	GPIO 26
+VCC	5V
+GND	GND
+
+
+ESP32 ↔ Bluetooth Status LED
+
+LED Part	ESP32 Pin
+LED +	GPIO 2 through 220Ω resistor
+LED -	GND
+
+
+Water Sensor Pin	ESP32 Pin
+
+One Wire	GPIO 27
+Other Wire	GND
+ 
+for more sensitive use BC547 transistor 
