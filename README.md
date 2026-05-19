@@ -1,2 +1,4 @@
 # -WLC-Water-Level-Controller-
-it can a beat project 
+it can be a beat project for Hackathon
+there is only prototype it work on Bluetooth 
+
